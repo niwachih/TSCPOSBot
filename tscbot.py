@@ -38,6 +38,10 @@ app = Flask(__name__)
 
 # 健康檢查用 (Cloud Run / LINE 驗證方便測試)
 @app.route("/", methods=["GET"])
+def health_root():
+    return "OK", 200
+
+@app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
@@ -51,16 +55,38 @@ line_bot_api = LineBotApi(os.environ.get("LINE_BOT_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.environ.get("LINE_BOT_CHANNEL_SECRET"))
 ALLOWED_DESTINATION = os.environ.get("ALLOWED_DESTINATION")
 
-# Google Sheets setup
-gc = pygsheets.authorize(service_account_file='service_account_key.json')
-sheet = gc.open_by_url(os.environ.get("GOOGLESHEET_URL"))
+# ---------- Google Sheets 延遲初始化（改用環境變數中的 JSON 憑證） ----------
+_gc = None
+_sheet = None
+
+def get_sheet():
+    """以 FIRESTORE 環境變數中的 service account JSON 建立 pygsheets 憑證並開啟指定 Google Sheet"""
+    global _gc, _sheet
+    if _sheet is None:
+        firestore_json = os.getenv("FIRESTORE")
+        if not firestore_json:
+            raise RuntimeError("FIRESTORE environment variable is not set.")
+        cred_info = json.loads(firestore_json)
+        creds = service_account.Credentials.from_service_account_info(
+            cred_info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        _gc = pygsheets.authorize(custom_credentials=creds)
+        gs_url = os.environ.get("GOOGLESHEET_URL")
+        if not gs_url:
+            raise RuntimeError("GOOGLESHEET_URL environment variable is not set.")
+        _sheet = _gc.open_by_url(gs_url)
+    return _sheet
+# ---------------------------------------------------------------------------
 
 # Firestore setup
 def get_firestore_client_from_env():
     firestore_json = os.getenv("FIRESTORE")
     if not firestore_json:
         raise ValueError("FIRESTORE environment variable is not set.")
-    
     cred_info = json.loads(firestore_json)
     credentials = service_account.Credentials.from_service_account_info(cred_info)
     return firestore.Client(credentials=credentials, project=cred_info["project_id"])
@@ -73,32 +99,34 @@ db = get_firestore_client_from_env()
 
 # Load questions and answers from Google Sheets 主要QA
 def load_sheet_data():
+    sheet = get_sheet()
     # Main questions
     main_ws = sheet.worksheet("title", "表單回應")
     main_questions = main_ws.get_col(3, include_tailing_empty=False)
     main_answers = main_ws.get_col(4, include_tailing_empty=False)
-    
+
     # 取得 "CPC問題" 和 "CPC點數" 的值
     cpc_ws = sheet.worksheet("title", "中油點數")
     cpc_questions = cpc_ws.get_col(8, include_tailing_empty=False)
     cpc_answers = cpc_ws.get_col(9, include_tailing_empty=False)
     cpc_list = cpc_ws.get_col(1, include_tailing_empty=False)
-    
+
     return main_questions + cpc_questions, main_answers + cpc_answers, cpc_list
 
 questions_in_sheet, answers_in_sheet, cpc_list = load_sheet_data()
 
 # Load synonyms dictionary
 def load_synonyms():
+    sheet = get_sheet()
     syn_ws = sheet.worksheet("title", "同義詞")
     synonym_rows = syn_ws.get_all_values()
-    
+
     synonym_dict = {}
     for row in synonym_rows:
         synonyms = [word.strip() for word in row if word.strip()]
         for word in synonyms:
             synonym_dict[word] = set(synonyms) - {word}
-    
+
     return synonym_dict
 
 synonym_dict = load_synonyms()
@@ -128,21 +156,15 @@ def expand_query(query):
     """擴展查詢詞，加入同義詞"""
     words = jieba.lcut(query)
     expanded_words = set(words)
-    
+
     for word in words:
         if word in synonym_dict:
             expanded_words.update(synonym_dict[word])
-    
+
     return " ".join(expanded_words)
 
 def retrieve_top_n(query, n=2, threshold=5, high_threshold=10):
-    """取得最相似的問題
-    ##作法
-    1.使用Sentence Transformers進行相似度計算
-    2.使用BM25強化搜索
-    3.閥值為5，超過才列為答案
-    4.最多選擇2個答案 
-    """
+    """取得最相似的問題"""
     try:
         expanded_query = expand_query(query)
         tokenized_query = list(jieba.cut(expanded_query))
@@ -157,18 +179,18 @@ def retrieve_top_n(query, n=2, threshold=5, high_threshold=10):
         above_threshold_indices = [
             i for i, score in enumerate(combined_scores) if score >= threshold
         ]
-        
+
         if not above_threshold_indices:
             return []
         # 2. 按照綜合分數排序
         sorted_indices = sorted(
             above_threshold_indices, key=lambda i: combined_scores[i], reverse=True
         )
-        
+
         high_score_indices = [
             i for i in sorted_indices if combined_scores[i] >= high_threshold
         ]
-        
+
         result = []
         if len(high_score_indices) >= 2:
             # 如果有兩個或以上高分結果，返回前n個
@@ -202,7 +224,7 @@ def retrieve_top_n(query, n=2, threshold=5, high_threshold=10):
                 target=record_question_for_answer,
                 args=(questions_in_sheet[sorted_indices[0]],),
             ).start()
-        
+
         return result
     except Exception as e:
         print(f"Error in retrieve_top_n: {str(e)}")
@@ -233,11 +255,11 @@ def extract_chinese_results_new(response):
     """從模型回應中提取中文內容"""
     try:
         text_content = response.candidates[0].content.parts[0].text
-        
+
         if "\\u" in text_content:
             decoded_text = text_content.encode().decode("unicode_escape")
             return decoded_text
-        
+
         return text_content
     except (AttributeError, IndexError, UnicodeError):
         return ""
@@ -251,12 +273,12 @@ def find_closest_question_and_llm_reply(query):
                 "answer": "目前找不到合適的答案，請再試一次或換個問法",
                 "top_matches": [],
             }
-        
+
         answers_only = [match["answer"] for match in top_matches]
         result = reply_by_LLM(answers_only, generation_model)
         answer_to_line = extract_chinese_results_new(result)
         return {"answer": answer_to_line, "top_matches": top_matches}
-    
+
     except Exception as e:
         print(f"Error in find_closest_question_and_llm_reply: {str(e)}")
         return {
@@ -271,18 +293,19 @@ def find_closest_question_and_llm_reply(query):
 def get_top_questions():
     """獲取熱門問題前5名"""
     try:
+        sheet = get_sheet()
         ranking_ws = sheet.worksheet("title", "熱門排行")
         print("Found '熱門排行' worksheet.")
     except pygsheets.WorksheetNotFound:
         print("熱門排行 worksheet not found.")
         return []
-    
+
     top_ranking_records = ranking_ws.get_all_records()[:5]
     top_questions = []
-    
+
     main_ws = sheet.worksheet("title", "表單回應")
     main_records = main_ws.get_all_records()
-    
+
     for record in top_ranking_records:
         full_question = next(
             (item for item in main_records if item["問題描述"] == record["項目"]), None
@@ -294,19 +317,20 @@ def get_top_questions():
                 "問題描述": full_question["問題描述"],
                 "解決方式": full_question["解決方式"],
             })
-    
+
     print(f"Top 5 questions with descriptions: {top_questions}")
     return top_questions
 
 def get_unique_categories():
     """獲取唯一問題分類"""
     try:
+        sheet = get_sheet()
         main_ws = sheet.worksheet("title", "表單回應")
         categories_column = main_ws.get_col(2)
         unique_categories = sorted(
             list(set(cat.strip() for cat in categories_column[1:] if cat.strip()))
         )
-        
+
         print(f"Found {len(unique_categories)} unique categories: {unique_categories}")
         return unique_categories
     except Exception as e:
@@ -316,9 +340,10 @@ def get_unique_categories():
 def get_questions_by_category(category):
     """根據分類獲取問題"""
     try:
+        sheet = get_sheet()
         main_ws = sheet.worksheet("title", "表單回應")
         all_data = main_ws.get_all_values()
-        
+
         questions = []
         for row in all_data[1:]:
             if len(row) > 2 and row[1].strip() == category.strip():
@@ -328,7 +353,7 @@ def get_questions_by_category(category):
                         "問題描述": question_text,
                         "解決方式": "",
                     })
-        
+
         print(f"Total {len(questions)} questions found for category '{category}'")
         return questions
     except Exception as e:
@@ -338,15 +363,16 @@ def get_questions_by_category(category):
 def find_solution_by_click_question(question_text):
     """找對應問題的解決方式"""
     try:
+        sheet = get_sheet()
         main_ws = sheet.worksheet("title", "表單回應")
         all_data = main_ws.get_all_values()
-        
+
         for row in all_data[1:]:
             if len(row) > 3 and row[2].strip() == question_text.strip():
                 solution = row[3].strip()
                 print(f"Found solution for question '{question_text}': {solution}")
                 return solution
-        
+
         print(f"No solution found for question '{question_text}'")
         return None
     except Exception as e:
@@ -357,7 +383,7 @@ def get_oil_points_column_a():
     """獲取中油點數資料"""
     if not cpc_list or len(cpc_list) == 0:
         return "中油點數表單的 A 欄沒有資料。"
-    
+
     return "\n".join(cpc_list)
 
 ###############################################################################
@@ -366,8 +392,7 @@ def get_oil_points_column_a():
 
 def record_question(user_id, user_input):
     """記錄用戶問題到統計紀錄"""
-    gc = pygsheets.authorize(service_account_file='service_account_key.json')
-    sheet = gc.open_by_url(os.environ.get("GOOGLESHEET_URL"))
+    sheet = get_sheet()
     try:
         profile = line_bot_api.get_profile(user_id)
         user_name = profile.display_name
@@ -375,7 +400,7 @@ def record_question(user_id, user_input):
     except LineBotApiError as e:
         user_name = "Unknown"
         print(f"Error getting user profile: {e}")
-    
+
     try:
         stats_ws = sheet.worksheet("title", "統計紀錄")
         print("Found '統計紀錄' worksheet.")
@@ -383,7 +408,7 @@ def record_question(user_id, user_input):
         stats_ws = sheet.add_worksheet("統計紀錄")
         stats_ws.update_row(1, ["時間", "使用者ID", "使用者名稱", "詢問文字"])
         print("Created '統計紀錄' worksheet.")
-    
+
     timestamp = datetime.now(GMT_8).strftime("%Y-%m-%d %H:%M:%S")
     record_data = [timestamp, user_id, user_name, user_input]
     stats_ws.insert_rows(row=1, values=record_data, inherit=True)
@@ -391,8 +416,7 @@ def record_question(user_id, user_input):
 
 def record_question_for_answer(question_for_answer):
     """記錄回答問題到回答工作表"""
-    gc = pygsheets.authorize(service_account_file='service_account_key.json')
-    sheet = gc.open_by_url(os.environ.get("GOOGLESHEET_URL"))
+    sheet = get_sheet()
     try:
         reply_ws = sheet.worksheet("title", "回答")
         print("Found '回答' worksheet.")
@@ -400,7 +424,7 @@ def record_question_for_answer(question_for_answer):
         reply_ws = sheet.add_worksheet("回答")
         reply_ws.update_row(1, ["時間", "問題"])
         print("Created '回答' worksheet.")
-    
+
     timestamp = datetime.now(GMT_8).strftime("%Y-%m-%d %H:%M:%S")
     record_data = [timestamp, question_for_answer]
     reply_ws.insert_rows(row=1, values=record_data, inherit=True)
@@ -435,7 +459,7 @@ def create_category_and_common_features():
             ],
         )
     )
-    
+
     return FlexSendMessage(
         alt_text="請選擇問題分類",
         contents=CarouselContainer(contents=[category_bubble]),
@@ -448,7 +472,7 @@ def create_flex_message(title, items, item_type="category", start_index=1):
         bubble_contents = [
             TextComponent(text=title, weight="bold", size="xl", margin="md")
         ]
-        
+
         for idx, item in enumerate(items[i : i + 10], start=start_index):
             label_text = (
                 f"{idx}. {item['問題描述'] if item_type == 'question' else item}"
@@ -458,7 +482,7 @@ def create_flex_message(title, items, item_type="category", start_index=1):
                 if item_type == "question"
                 else f"問題分類: {item}"
             )
-            
+
             bubble_contents.append(
                 TextComponent(
                     text=label_text,
@@ -469,7 +493,7 @@ def create_flex_message(title, items, item_type="category", start_index=1):
                     action=MessageAction(label=label_text[:20], text=action_text),
                 )
             )
-        
+
         bubble_contents.append(SeparatorComponent(margin="md"))
         bubble_contents.append(
             TextComponent(
@@ -480,14 +504,14 @@ def create_flex_message(title, items, item_type="category", start_index=1):
                 action=MessageAction(label="問題分類", text="返回問題分類"),
             )
         )
-        
+
         bubbles.append(
             BubbleContainer(
                 body=BoxComponent(layout="vertical", contents=bubble_contents)
             )
         )
         start_index += 10
-    
+
     print(f"Generated Flex Message with title '{title}' and {len(bubbles)} bubbles.")
     return (
         FlexSendMessage(
@@ -548,11 +572,11 @@ def build_flex_response(answer, conversation_id):
 @app.route("/callback", methods=["POST"])
 def callback():
     print(f"Version Code: {VERSION_CODE}")
-    
+
     signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
     print("Request body:", body)
-    
+
     try:
         payload = json.loads(body)
         if payload.get("destination") != ALLOWED_DESTINATION:
@@ -561,7 +585,7 @@ def callback():
     except Exception as e:
         print("Payload parsing error:", e)
         return "Bad Request", 400
-    
+
     try:
         handler.handle(body, signature)
         print("Message handled successfully.")
@@ -574,17 +598,17 @@ def callback():
 def handle_message(event):
     user_input = event.message.text
     user_id = event.source.user_id
-    
+
     if user_input.startswith("知識寶典") or user_input.startswith("返回問題分類"):
         reply = create_category_and_common_features()
         print("Displayed category and common features message.")
-    
+
     elif user_input.startswith("問題分類:"):
         category = user_input.replace("問題分類:", "", 1).strip()
         print(f"Processing category request: '{category}'")
-        
+
         questions = get_questions_by_category(category)
-        
+
         if questions:
             print(f"Found {len(questions)} questions for category '{category}'")
             reply = create_flex_message(f"{category} - 問題列表", questions, "question")
@@ -593,13 +617,13 @@ def handle_message(event):
             reply = TextSendMessage(
                 text=f"找不到「{category}」分類的相關問題。請確認分類名稱是否正確。"
             )
-    
+
     elif user_input.startswith("問題:"):
         question = user_input.replace("問題:", "", 1).strip()
         print(f"Looking for solution to question: '{question}'")
-        
+
         solution = find_solution_by_click_question(question)
-        
+
         if solution:
             reply_contents = [
                 TextComponent(text="解決方式", weight="bold", size="lg", margin="md"),
@@ -616,7 +640,7 @@ def handle_message(event):
                     action=MessageAction(label="返回問題分類", text="返回問題分類"),
                 ),
             ]
-            
+
             reply = FlexSendMessage(
                 alt_text="解決方式",
                 contents=BubbleContainer(
@@ -629,7 +653,7 @@ def handle_message(event):
         else:
             reply = TextSendMessage(text="找不到該問題的解決方式。")
             print(f"No solution found for question: {question}")
-    
+
     elif user_input == "熱門查詢":
         top_questions = get_top_questions()
         if top_questions:
@@ -637,22 +661,22 @@ def handle_message(event):
         else:
             reply = TextSendMessage(text="目前沒有熱門排行記錄。")
         print("Displayed top 5 questions.")
-    
+
     elif user_input == "查中油點數":
         oil_points_message = get_oil_points_column_a()
         reply = TextSendMessage(text=oil_points_message)
         print("Displayed '中油兌換點數' column A.")
-    
+
     else:
         try:
             result_bundle = find_closest_question_and_llm_reply(user_input)
             conversation_id = f"conv_{user_id}_{int(time.time())}"
             reply = build_flex_response(result_bundle["answer"], conversation_id)
             print(f"Show LLM answer for question: {user_input}")
-            
+
             if result_bundle["top_matches"]:
                 top1 = result_bundle["top_matches"][0]
-                
+
                 db.collection("conversations").add({
                     "conversation_id": conversation_id,
                     "user_id": user_id,
@@ -665,17 +689,17 @@ def handle_message(event):
                     "model_version": VERSION_CODE,
                     "timestamp": firestore.SERVER_TIMESTAMP
                 })
-        
+
         except Exception as e:
             print(f"Error in find_closest_question_and_llm_reply: {str(e)}")
             reply = TextSendMessage(text="機器人暫時無法使用，請聯絡積慧幫忙協助")
-    
+
     try:
         line_bot_api.reply_message(event.reply_token, reply)
         print("Reply sent successfully.")
     except LineBotApiError as e:
         print(f"Failed to send reply: {e}")
-    
+
     # 非同步記錄用戶提問
     threading.Thread(target=record_question, args=(user_id, user_input)).start()
 
@@ -687,14 +711,14 @@ def handle_postback(event):
     feedback_type = params.get("feedback")
     conversation_id = params.get("conv_id")
     user_id = event.source.user_id
-    
+
     db.collection("feedback").add({
         "user_id": user_id,
         "conversation_id": conversation_id,
         "feedback_type": feedback_type,
         "timestamp": firestore.SERVER_TIMESTAMP
     })
-    
+
     line_bot_api.reply_message(
         event.reply_token, TextSendMessage(text="感謝您的回饋 🙏")
     )
