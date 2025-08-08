@@ -1,7 +1,9 @@
-#functions-framework==3.4.0
-#lock CPU version
---index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1
+# 移除 functions-framework==3.4.0
+# lock CPU version
+# 先保留 PyPI，再補 CPU 版 PyTorch 的來源
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.4.1+cpu
 Flask==2.3.3
 gunicorn==20.1.0
 line-bot-sdk
