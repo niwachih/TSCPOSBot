@@ -36,6 +36,11 @@ print(f"Starting application - Version Code: {VERSION_CODE}")
 
 app = Flask(__name__)
 
+# 健康檢查用 (Cloud Run / LINE 驗證方便測試)
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
+
 # Initialize Gemini API
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=gemini_api_key)
