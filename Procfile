@@ -1,1 +1,1 @@
-web: python tscbot.py
+web: gunicorn tscbot:app
