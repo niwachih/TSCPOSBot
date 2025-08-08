@@ -1,5 +1,6 @@
-functions-framework==3.4.0
-Flask
+#functions-framework==3.4.0
+Flask==2.3.3
+gunicorn==20.1.0
 line-bot-sdk
 google-generativeai
 pygsheets
@@ -9,6 +10,6 @@ pytz
 sentence_transformers
 jieba
 
-#以下GCP需要
+# 以下 GCP 需要
 google-cloud-firestore
 google-auth
