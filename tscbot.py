@@ -38,7 +38,7 @@ app = Flask(__name__)
 
 # 健康檢查用 (Cloud Run / LINE 驗證方便測試)
 @app.route("/", methods=["GET"])
-def health_root():
+def root_health():
     return "OK", 200
 
 @app.route("/health", methods=["GET"])
@@ -50,37 +50,10 @@ gemini_api_key = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=gemini_api_key)
 generation_model = genai.GenerativeModel("gemini-2.0-flash")
 
-# LINE Bot setup
+# LINE Bot setup（保持原寫法，但在 webhook 才會用到；環境變數若遺失，這裡會拋錯）
 line_bot_api = LineBotApi(os.environ.get("LINE_BOT_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.environ.get("LINE_BOT_CHANNEL_SECRET"))
 ALLOWED_DESTINATION = os.environ.get("ALLOWED_DESTINATION")
-
-# ---------- Google Sheets 延遲初始化（改用環境變數中的 JSON 憑證） ----------
-_gc = None
-_sheet = None
-
-def get_sheet():
-    """以 FIRESTORE 環境變數中的 service account JSON 建立 pygsheets 憑證並開啟指定 Google Sheet"""
-    global _gc, _sheet
-    if _sheet is None:
-        firestore_json = os.getenv("FIRESTORE")
-        if not firestore_json:
-            raise RuntimeError("FIRESTORE environment variable is not set.")
-        cred_info = json.loads(firestore_json)
-        creds = service_account.Credentials.from_service_account_info(
-            cred_info,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ],
-        )
-        _gc = pygsheets.authorize(custom_credentials=creds)
-        gs_url = os.environ.get("GOOGLESHEET_URL")
-        if not gs_url:
-            raise RuntimeError("GOOGLESHEET_URL environment variable is not set.")
-        _sheet = _gc.open_by_url(gs_url)
-    return _sheet
-# ---------------------------------------------------------------------------
 
 # Firestore setup
 def get_firestore_client_from_env():
@@ -93,11 +66,19 @@ def get_firestore_client_from_env():
 
 db = get_firestore_client_from_env()
 
+# ---- 將 Google Sheets 客戶端改成 lazy，避免 import 時就掛 ----
+def get_sheet():
+    """取得 pygsheets 的 Sheet 物件（lazy 授權、lazy 開啟）。"""
+    gc = pygsheets.authorize(service_account_file='service_account_key.json')
+    url = os.environ.get("GOOGLESHEET_URL")
+    if not url:
+        raise ValueError("GOOGLESHEET_URL environment variable is not set.")
+    return gc.open_by_url(url)
+
 ###############################################################################
-# DATA LOADING AND PREPROCESSING
+# DATA LOADING AND PREPROCESSING（改為 lazy 初始化）
 ###############################################################################
 
-# Load questions and answers from Google Sheets 主要QA
 def load_sheet_data():
     sheet = get_sheet()
     # Main questions
@@ -105,7 +86,7 @@ def load_sheet_data():
     main_questions = main_ws.get_col(3, include_tailing_empty=False)
     main_answers = main_ws.get_col(4, include_tailing_empty=False)
 
-    # 取得 "CPC問題" 和 "CPC點數" 的值
+    # 取得 "中油點數" 的值
     cpc_ws = sheet.worksheet("title", "中油點數")
     cpc_questions = cpc_ws.get_col(8, include_tailing_empty=False)
     cpc_answers = cpc_ws.get_col(9, include_tailing_empty=False)
@@ -113,9 +94,6 @@ def load_sheet_data():
 
     return main_questions + cpc_questions, main_answers + cpc_answers, cpc_list
 
-questions_in_sheet, answers_in_sheet, cpc_list = load_sheet_data()
-
-# Load synonyms dictionary
 def load_synonyms():
     sheet = get_sheet()
     syn_ws = sheet.worksheet("title", "同義詞")
@@ -126,18 +104,9 @@ def load_synonyms():
         synonyms = [word.strip() for word in row if word.strip()]
         for word in synonyms:
             synonym_dict[word] = set(synonyms) - {word}
-
     return synonym_dict
 
-synonym_dict = load_synonyms()
-
-# Initialize ML models
-# 先對問句進行分詞
-tokenized_questions = [list(jieba.cut(q)) for q in questions_in_sheet]
-# 建立 BM25 模型
-bm25 = BM25Okapi(tokenized_questions)
-
-# 載入中文句向量模型
+# 載入中文句向量模型（lazy）
 _model = None
 def get_model():
     global _model
@@ -146,7 +115,40 @@ def get_model():
         _model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
     return _model
 
-question_embeddings = get_model().encode(questions_in_sheet)
+# ---- Lazy 初始化快取 ----
+_qa_loaded = False
+questions_in_sheet = []
+answers_in_sheet = []
+cpc_list = []
+synonym_dict = {}
+bm25 = None
+question_embeddings = None
+
+def ensure_qa_index():
+    """第一次需要時才載入 Google Sheet、同義詞、BM25 與向量。失敗時不讓整個 app 掛掉。"""
+    global _qa_loaded, questions_in_sheet, answers_in_sheet, cpc_list
+    global synonym_dict, bm25, question_embeddings
+
+    if _qa_loaded:
+        return True
+
+    try:
+        # 讀取表單資料
+        questions_in_sheet, answers_in_sheet, cpc_list = load_sheet_data()
+        # 同義詞
+        synonym_dict = load_synonyms()
+        # BM25
+        tokenized_questions = [list(jieba.cut(q)) for q in questions_in_sheet]
+        bm25 = BM25Okapi(tokenized_questions)
+        # Sentence-Transformer 向量
+        question_embeddings = get_model().encode(questions_in_sheet)
+        _qa_loaded = True
+        print("QA index loaded successfully.")
+        return True
+    except Exception as e:
+        # 只記 log，不讓應用啟動失敗；實際查詢時回預設訊息
+        print(f"ensure_qa_index error: {e}")
+        return False
 
 ###############################################################################
 # SEARCH AND RETRIEVAL FUNCTIONS
@@ -154,18 +156,21 @@ question_embeddings = get_model().encode(questions_in_sheet)
 
 def expand_query(query):
     """擴展查詢詞，加入同義詞"""
+    # 若同義詞尚未載入也不阻擋查詢（退化為原字詞）
     words = jieba.lcut(query)
     expanded_words = set(words)
-
-    for word in words:
-        if word in synonym_dict:
-            expanded_words.update(synonym_dict[word])
-
+    if synonym_dict:
+        for word in words:
+            if word in synonym_dict:
+                expanded_words.update(synonym_dict[word])
     return " ".join(expanded_words)
 
 def retrieve_top_n(query, n=2, threshold=5, high_threshold=10):
-    """取得最相似的問題"""
+    """取得最相似的問題（BM25 + ST）"""
     try:
+        if not ensure_qa_index():
+            return []
+
         expanded_query = expand_query(query)
         tokenized_query = list(jieba.cut(expanded_query))
         # BM25 排序
@@ -173,27 +178,21 @@ def retrieve_top_n(query, n=2, threshold=5, high_threshold=10):
         # Sentence Transformers 相似度計算(餘弦相似度)
         query_embedding = get_model().encode([query])[0]
         semantic_scores = np.dot(question_embeddings, query_embedding)
-        # 兩者加權平均（可調整權重）
+        # 兩者加權
         combined_scores = 0.7 * np.array(bm25_scores) + 0.3 * semantic_scores
-        # 1. 篩選出超過基本閾值的結果
-        above_threshold_indices = [
-            i for i, score in enumerate(combined_scores) if score >= threshold
-        ]
 
+        # 1. 閾值過濾
+        above_threshold_indices = [i for i, s in enumerate(combined_scores) if s >= threshold]
         if not above_threshold_indices:
             return []
-        # 2. 按照綜合分數排序
-        sorted_indices = sorted(
-            above_threshold_indices, key=lambda i: combined_scores[i], reverse=True
-        )
 
-        high_score_indices = [
-            i for i in sorted_indices if combined_scores[i] >= high_threshold
-        ]
+        # 2. 排序
+        sorted_indices = sorted(above_threshold_indices, key=lambda i: combined_scores[i], reverse=True)
+        high_score_indices = [i for i in sorted_indices if combined_scores[i] >= high_threshold]
 
         result = []
         if len(high_score_indices) >= 2:
-            # 如果有兩個或以上高分結果，返回前n個
+            # 有兩個或以上高分結果，返回前 n 個
             result = [
                 {
                     "question": questions_in_sheet[i],
@@ -209,7 +208,7 @@ def retrieve_top_n(query, n=2, threshold=5, high_threshold=10):
                 args=(questions_in_sheet[high_score_indices[0]],),
             ).start()
         else:
-            # 如果沒有或只有一個高分結果，只返回最高分的一個
+            # 否則僅返回最高分一個
             i = sorted_indices[0]
             result = [
                 {
@@ -255,11 +254,9 @@ def extract_chinese_results_new(response):
     """從模型回應中提取中文內容"""
     try:
         text_content = response.candidates[0].content.parts[0].text
-
         if "\\u" in text_content:
             decoded_text = text_content.encode().decode("unicode_escape")
             return decoded_text
-
         return text_content
     except (AttributeError, IndexError, UnicodeError):
         return ""
@@ -267,6 +264,12 @@ def extract_chinese_results_new(response):
 def find_closest_question_and_llm_reply(query):
     """主要的問答處理函數"""
     try:
+        if not ensure_qa_index():
+            return {
+                "answer": "目前服務初始化中或資料不可用，請稍後再試。",
+                "top_matches": [],
+            }
+
         top_matches = retrieve_top_n(query)
         if not top_matches:
             return {
@@ -287,7 +290,7 @@ def find_closest_question_and_llm_reply(query):
         }
 
 ###############################################################################
-# DATA RETRIEVAL FUNCTIONS
+# DATA RETRIEVAL FUNCTIONS（讀表單仍用即時查詢，不在 import 時進行）
 ###############################################################################
 
 def get_top_questions():
@@ -298,6 +301,9 @@ def get_top_questions():
         print("Found '熱門排行' worksheet.")
     except pygsheets.WorksheetNotFound:
         print("熱門排行 worksheet not found.")
+        return []
+    except Exception as e:
+        print(f"Error in get_top_questions: {e}")
         return []
 
     top_ranking_records = ranking_ws.get_all_records()[:5]
@@ -330,7 +336,6 @@ def get_unique_categories():
         unique_categories = sorted(
             list(set(cat.strip() for cat in categories_column[1:] if cat.strip()))
         )
-
         print(f"Found {len(unique_categories)} unique categories: {unique_categories}")
         return unique_categories
     except Exception as e:
@@ -380,11 +385,18 @@ def find_solution_by_click_question(question_text):
         return None
 
 def get_oil_points_column_a():
-    """獲取中油點數資料"""
-    if not cpc_list or len(cpc_list) == 0:
+    """獲取中油點數資料（如果尚未載入 cpc_list，改成即時讀取）"""
+    try:
+        if not cpc_list:
+            # 即時補讀，避免第一次就取不到
+            _, _, tmp_cpc = load_sheet_data()
+            if not tmp_cpc:
+                return "中油點數表單的 A 欄沒有資料。"
+            return "\n".join(tmp_cpc)
+        return "\n".join(cpc_list)
+    except Exception as e:
+        print(f"Error in get_oil_points_column_a: {e}")
         return "中油點數表單的 A 欄沒有資料。"
-
-    return "\n".join(cpc_list)
 
 ###############################################################################
 # LOGGING FUNCTIONS
@@ -392,43 +404,49 @@ def get_oil_points_column_a():
 
 def record_question(user_id, user_input):
     """記錄用戶問題到統計紀錄"""
-    sheet = get_sheet()
     try:
-        profile = line_bot_api.get_profile(user_id)
-        user_name = profile.display_name
-        print(f"Fetched user profile: {user_name}")
-    except LineBotApiError as e:
-        user_name = "Unknown"
-        print(f"Error getting user profile: {e}")
+        sheet = get_sheet()
+        try:
+            profile = line_bot_api.get_profile(user_id)
+            user_name = profile.display_name
+            print(f"Fetched user profile: {user_name}")
+        except LineBotApiError as e:
+            user_name = "Unknown"
+            print(f"Error getting user profile: {e}")
 
-    try:
-        stats_ws = sheet.worksheet("title", "統計紀錄")
-        print("Found '統計紀錄' worksheet.")
-    except pygsheets.WorksheetNotFound:
-        stats_ws = sheet.add_worksheet("統計紀錄")
-        stats_ws.update_row(1, ["時間", "使用者ID", "使用者名稱", "詢問文字"])
-        print("Created '統計紀錄' worksheet.")
+        try:
+            stats_ws = sheet.worksheet("title", "統計紀錄")
+            print("Found '統計紀錄' worksheet.")
+        except pygsheets.WorksheetNotFound:
+            stats_ws = sheet.add_worksheet("統計紀錄")
+            stats_ws.update_row(1, ["時間", "使用者ID", "使用者名稱", "詢問文字"])
+            print("Created '統計紀錄' worksheet.")
 
-    timestamp = datetime.now(GMT_8).strftime("%Y-%m-%d %H:%M:%S")
-    record_data = [timestamp, user_id, user_name, user_input]
-    stats_ws.insert_rows(row=1, values=record_data, inherit=True)
-    print(f"Recorded question: {record_data}")
+        timestamp = datetime.now(GMT_8).strftime("%Y-%m-%d %H:%M:%S")
+        record_data = [timestamp, user_id, user_name, user_input]
+        stats_ws.insert_rows(row=1, values=record_data, inherit=True)
+        print(f"Recorded question: {record_data}")
+    except Exception as e:
+        print(f"record_question error: {e}")
 
 def record_question_for_answer(question_for_answer):
     """記錄回答問題到回答工作表"""
-    sheet = get_sheet()
     try:
-        reply_ws = sheet.worksheet("title", "回答")
-        print("Found '回答' worksheet.")
-    except pygsheets.WorksheetNotFound:
-        reply_ws = sheet.add_worksheet("回答")
-        reply_ws.update_row(1, ["時間", "問題"])
-        print("Created '回答' worksheet.")
+        sheet = get_sheet()
+        try:
+            reply_ws = sheet.worksheet("title", "回答")
+            print("Found '回答' worksheet.")
+        except pygsheets.WorksheetNotFound:
+            reply_ws = sheet.add_worksheet("回答")
+            reply_ws.update_row(1, ["時間", "問題"])
+            print("Created '回答' worksheet.")
 
-    timestamp = datetime.now(GMT_8).strftime("%Y-%m-%d %H:%M:%S")
-    record_data = [timestamp, question_for_answer]
-    reply_ws.insert_rows(row=1, values=record_data, inherit=True)
-    print(f"Recorded question: {record_data}")
+        timestamp = datetime.now(GMT_8).strftime("%Y-%m-%d %H:%M:%S")
+        record_data = [timestamp, question_for_answer]
+        reply_ws.insert_rows(row=1, values=record_data, inherit=True)
+        print(f"Recorded question: {record_data}")
+    except Exception as e:
+        print(f"record_question_for_answer error: {e}")
 
 ###############################################################################
 # UI AND FLEX MESSAGE FUNCTIONS
