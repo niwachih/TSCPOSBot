@@ -1,0 +1,20 @@
+1. Fast Redeploy:
+gcloud run services update tscposbot --region=asia-east1 --update-env-vars "FORCE_DEPLOY=$(date +%s)"
+
+2. Check Start Log:
+gcloud run services logs read tscposbot --region=asia-east1 --limit=50
+
+3. Fast Deploy (need project ID):
+3.a Get Project ID:
+gcloud projects list
+3.b Deploy:
+gcloud run deploy tscposbot \
+  --project=tpo-pos-chatbot \
+  --region=asia-east1 \
+  --source=. \
+  --allow-unauthenticated
+
+4. Set Environmental Variables:
+gcloud run services update tscposbot \
+  --region=asia-east1 \
+  --update-env-vars LINE_BOT_CHANNEL_ACCESS_TOKEN="xxx",LINE_BOT_CHANNEL_SECRET="ooo"
